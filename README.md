@@ -274,13 +274,14 @@ Scan the QR code to join our community. If the code is expired, please add WeCha
 If you find **AutoFigure** or **FigureBench** helpful, please cite:
 
 ```bibtex
-@inproceedings{
-zhu2026autofigure,
-title={AutoFigure: Generating and Refining Publication-Ready Scientific Illustrations},
-author={Minjun Zhu and Zhen Lin and Yixuan Weng and Panzhong Lu and Qiujie Xie and Yifan Wei and Yifan_Wei and Sifan Liu and QiYao Sun and Yue Zhang},
-booktitle={The Fourteenth International Conference on Learning Representations},
-year={2026},
-url={https://openreview.net/forum?id=5N3z9JQJKq}
+@misc{lin2026autofigureeditgeneratingeditablescientific,
+      title={AutoFigure-Edit: Generating Editable Scientific Illustration}, 
+      author={Zhen Lin and Qiujie Xie and Minjun Zhu and Shichen Li and Qiyao Sun and Enhao Gu and Yiran Ding and Ke Sun and Fang Guo and Panzhong Lu and Zhiyuan Ning and Yixuan Weng and Yue Zhang},
+      year={2026},
+      eprint={2603.06674},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2603.06674}, 
 }
 
 @dataset{figurebench2025,
