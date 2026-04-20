@@ -133,9 +133,10 @@ body::before {
   resize: vertical;
 }
 
-.field-group {
-  margin-bottom: 16px;
+.mode-switch {
+  margin-bottom: 20px;
 }
+
 
 .field-row {
   display: grid;

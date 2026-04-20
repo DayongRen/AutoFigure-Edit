@@ -73,13 +73,15 @@ import re
 import shutil
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
 
 import requests
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+from xml.sax.saxutils import escape
 from torchvision import transforms
 from transformers import AutoModelForImageSegmentation
 
@@ -104,13 +106,28 @@ PROVIDER_CONFIGS = {
         "default_image_model": "gemini-3-pro-image-preview",
         "default_svg_model": "gemini-3.1-pro",
     },
+    "local_vllm": {
+        "base_url": "http://127.0.0.1:8001/v1",
+        "default_image_model": "Qwen/Qwen2-VL-7B-Instruct",
+        "default_svg_model": "Qwen/Qwen2-VL-7B-Instruct",
+    },
+    "anthropic": {
+        "base_url": "https://api.anthropic.com",
+        "default_image_model": None,  # 不支持文生图
+        "default_svg_model": "claude-sonnet-4-6",
+    },
 }
 
-ProviderType = Literal["openrouter", "bianxie", "gemini"]
+ProviderType = Literal["openrouter", "bianxie", "gemini", "local_vllm", "anthropic"]
 PlaceholderMode = Literal["none", "box", "label"]
 GEMINI_DEFAULT_IMAGE_SIZE = "4K"
 IMAGE_SIZE_CHOICES = ("1K", "2K", "4K")
 BOXLIB_NO_ICON_MODE_KEY = "no_icon_mode"
+LOCAL_VLLM_DUMMY_API_KEY = "dummy"
+LOCAL_VLLM_MAX_IMAGE_EDGE_SINGLE = 1280
+LOCAL_VLLM_MAX_IMAGE_EDGE_DOUBLE = 768
+LOCAL_VLLM_MAX_IMAGE_EDGE_MULTI = 512
+LOCAL_VLLM_MAX_TOKENS = 2048
 
 # SAM3 API config
 SAM3_FAL_API_URL = "https://fal.run/fal-ai/sam-3/image"
@@ -119,6 +136,7 @@ SAM3_ROBOFLOW_API_URL = os.environ.get(
     "https://serverless.roboflow.com/sam3/concept_segment",
 )
 SAM3_API_TIMEOUT = 300
+DEFAULT_SAM3_CHECKPOINT_PATH = Path(__file__).resolve().parent / "sam3.pt"
 
 # Step 1 reference image settings (overridden by CLI)
 USE_REFERENCE_IMAGE = False
@@ -126,8 +144,70 @@ REFERENCE_IMAGE_PATH: Optional[str] = None
 
 
 # ============================================================================
+# 工具函数
+# ============================================================================
+
+def resolve_local_sam3_checkpoint_path(sam_checkpoint_path: Optional[str]) -> Path:
+    """解析本地 SAM3 checkpoint 路径，优先使用显式传入值，否则回退到项目默认路径。"""
+    raw_path = (sam_checkpoint_path or "").strip()
+    checkpoint_path = Path(raw_path).expanduser() if raw_path else DEFAULT_SAM3_CHECKPOINT_PATH
+
+    if checkpoint_path.suffix == ".part":
+        raise FileNotFoundError(f"SAM3 checkpoint 仍是未完成下载文件，不能直接使用: {checkpoint_path}")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"未找到本地 SAM3 checkpoint: {checkpoint_path}。"
+            f"请先下载完整 sam3.pt，或通过 --sam_checkpoint_path / SAM3_CHECKPOINT_PATH 指定。"
+        )
+    if checkpoint_path.stat().st_size < 1024 * 1024 * 1024:
+        raise FileNotFoundError(f"SAM3 checkpoint 文件过小，疑似下载不完整: {checkpoint_path}")
+
+    return checkpoint_path.resolve()
+
+
+# ============================================================================
 # 统一的 LLM 调用接口
 # ============================================================================
+
+def _local_vllm_image_edge_for_request(image_count: int) -> int:
+    if image_count <= 1:
+        return LOCAL_VLLM_MAX_IMAGE_EDGE_SINGLE
+    if image_count == 2:
+        return LOCAL_VLLM_MAX_IMAGE_EDGE_DOUBLE
+    return LOCAL_VLLM_MAX_IMAGE_EDGE_MULTI
+
+
+def _prepare_multimodal_contents_for_provider(contents: List[Any], provider: ProviderType) -> List[Any]:
+    if provider != "local_vllm":
+        return contents
+
+    image_count = sum(1 for part in contents if isinstance(part, Image.Image))
+    max_edge = _local_vllm_image_edge_for_request(image_count)
+    prepared_contents: List[Any] = []
+
+    for part in contents:
+        if not isinstance(part, Image.Image):
+            prepared_contents.append(part)
+            continue
+
+        prepared = part.copy().convert("RGB")
+        original_size = prepared.size
+        if max(original_size) > max_edge:
+            prepared.thumbnail((max_edge, max_edge), Image.LANCZOS)
+            print(
+                f"[local_vllm] 下采样多模态图片: "
+                f"{original_size[0]}x{original_size[1]} -> {prepared.size[0]}x{prepared.size[1]}"
+            )
+        prepared_contents.append(prepared)
+
+    return prepared_contents
+
+
+def _cap_max_tokens_for_provider(max_tokens: int, provider: ProviderType) -> int:
+    if provider == "local_vllm":
+        return min(max_tokens, LOCAL_VLLM_MAX_TOKENS)
+    return max_tokens
+
 
 def call_llm_text(
     prompt: str,
@@ -154,8 +234,13 @@ def call_llm_text(
     Returns:
         LLM 响应文本
     """
-    if provider == "bianxie":
-        return _call_bianxie_text(prompt, api_key, model, base_url, max_tokens, temperature)
+    if provider in ("bianxie", "local_vllm"):
+        effective_api_key = api_key or LOCAL_VLLM_DUMMY_API_KEY
+        effective_max_tokens = _cap_max_tokens_for_provider(max_tokens, provider)
+        return _call_bianxie_text(prompt, effective_api_key, model, base_url, effective_max_tokens, temperature)
+    if provider == "anthropic":
+        effective_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        return _call_anthropic_text(prompt, effective_api_key, model, max_tokens, temperature)
     if provider == "gemini":
         return _call_gemini_text(prompt, api_key, model, max_tokens, temperature)
     return _call_openrouter_text(prompt, api_key, model, base_url, max_tokens, temperature)
@@ -185,10 +270,23 @@ def call_llm_multimodal(
     Returns:
         LLM 响应文本
     """
-    if provider == "bianxie":
-        return _call_bianxie_multimodal(contents, api_key, model, base_url, max_tokens, temperature)
+    if provider in ("bianxie", "local_vllm"):
+        effective_api_key = api_key or LOCAL_VLLM_DUMMY_API_KEY
+        effective_contents = _prepare_multimodal_contents_for_provider(contents, provider)
+        effective_max_tokens = _cap_max_tokens_for_provider(max_tokens, provider)
+        return _call_bianxie_multimodal(
+            effective_contents,
+            effective_api_key,
+            model,
+            base_url,
+            effective_max_tokens,
+            temperature,
+        )
     if provider == "gemini":
         return _call_gemini_multimodal(contents, api_key, model, max_tokens, temperature)
+    if provider == "anthropic":
+        effective_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        return _call_anthropic_multimodal(contents, effective_api_key, model, max_tokens, temperature)
     return _call_openrouter_multimodal(contents, api_key, model, base_url, max_tokens, temperature)
 
 
@@ -214,6 +312,14 @@ def call_llm_image_generation(
     Returns:
         生成的 PIL Image，失败返回 None
     """
+    if provider == "local_vllm":
+        raise ValueError(
+            "local_vllm 仅支持已有图片 -> SVG 的步骤 4/4.5/4.6，不支持步骤一文本生图。"
+        )
+    if provider == "anthropic":
+        raise ValueError(
+            "anthropic (Claude) 仅支持已有图片 -> SVG 的步骤 4/4.5/4.6，不支持步骤一文本生图。"
+        )
     if provider == "bianxie":
         return _call_bianxie_image_generation(prompt, api_key, model, base_url, reference_image)
     if provider == "gemini":
@@ -295,6 +401,95 @@ def _call_bianxie_multimodal(
         return completion.choices[0].message.content if completion and completion.choices else None
     except Exception as e:
         print(f"[Bianxie] 多模态 API 调用失败: {e}")
+        raise
+
+
+def _call_anthropic_multimodal(
+    contents: List[Any],
+    api_key: str,
+    model: str,
+    max_tokens: int = 16000,
+    temperature: float = 0.7,
+) -> Optional[str]:
+    """使用 Anthropic SDK 调用 Claude 多模态接口（streaming 以支持长输出）"""
+    try:
+        import anthropic
+
+        # 支持代理：ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        effective_key = auth_token or api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+        client = anthropic.Anthropic(
+            api_key=effective_key,
+            **({"base_url": base_url} if base_url else {}),
+        )
+
+        message_content = []
+        for part in contents:
+            if isinstance(part, str):
+                message_content.append({"type": "text", "text": part})
+            elif isinstance(part, Image.Image):
+                buf = io.BytesIO()
+                part.save(buf, format="PNG")
+                image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                message_content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_b64,
+                    },
+                })
+
+        # 使用 streaming 避免长请求超时限制
+        result_parts = []
+        with client.messages.stream(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[{"role": "user", "content": message_content}],
+        ) as stream:
+            for text in stream.text_stream:
+                result_parts.append(text)
+
+        return "".join(result_parts) if result_parts else None
+    except Exception as e:
+        print(f"[Anthropic] 多模态 API 调用失败: {e}")
+        raise
+
+
+def _call_anthropic_text(
+    prompt: str,
+    api_key: str,
+    model: str,
+    max_tokens: int = 16000,
+    temperature: float = 0.7,
+) -> Optional[str]:
+    """使用 Anthropic SDK 调用 Claude 文本接口（streaming 以支持长输出）"""
+    try:
+        import anthropic
+
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        effective_key = auth_token or api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+        client = anthropic.Anthropic(
+            api_key=effective_key,
+            **({"base_url": base_url} if base_url else {}),
+        )
+        result_parts = []
+        with client.messages.stream(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            for text in stream.text_stream:
+                result_parts.append(text)
+        return "".join(result_parts) if result_parts else None
+    except Exception as e:
+        print(f"[Anthropic] 文本 API 调用失败: {e}")
         raise
 
 
@@ -1544,6 +1739,7 @@ def segment_with_sam3(
     sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
     sam_api_key: Optional[str] = None,
     sam_max_masks: int = 32,
+    sam_checkpoint_path: Optional[str] = None,
 ) -> tuple[str, str, list]:
     """
     使用 SAM3 分割图片，用灰色填充+黑色边框+序号标记，生成 boxlib.json
@@ -1591,6 +1787,9 @@ def segment_with_sam3(
         from sam3.model.sam3_image_processor import Sam3Processor
         import sam3
 
+        checkpoint_path = resolve_local_sam3_checkpoint_path(sam_checkpoint_path)
+        print(f"使用本地 SAM3 checkpoint: {checkpoint_path}")
+
         sam3_dir = Path(sam3.__path__[0]) if hasattr(sam3, '__path__') else Path(sam3.__file__).parent
         bpe_path = sam3_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz"
         if not bpe_path.exists():
@@ -1599,40 +1798,49 @@ def segment_with_sam3(
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"使用设备: {device}")
-        model = build_sam3_image_model(device=device, bpe_path=str(bpe_path) if bpe_path else None)
+        autocast_ctx = nullcontext()
+        model = build_sam3_image_model(
+            device=device,
+            bpe_path=str(bpe_path) if bpe_path else None,
+            checkpoint_path=str(checkpoint_path),
+            load_from_HF=False,
+        )
         processor = Sam3Processor(model, device=device)
-        inference_state = processor.set_image(image)
+        with autocast_ctx:
+            inference_state = processor.set_image(image)
 
-        for prompt in prompt_list:
-            print(f"\n  正在检测: '{prompt}'")
-            output = processor.set_text_prompt(state=inference_state, prompt=prompt)
+            for prompt in prompt_list:
+                print(f"\n  正在检测: '{prompt}'")
+                output = processor.set_text_prompt(state=inference_state, prompt=prompt)
 
-            boxes = output["boxes"]
-            scores = output["scores"]
+                boxes = output["boxes"]
+                scores = output["scores"]
 
-            if isinstance(boxes, torch.Tensor):
-                boxes = boxes.cpu().numpy()
-            if isinstance(scores, torch.Tensor):
-                scores = scores.cpu().numpy()
+                if isinstance(boxes, torch.Tensor):
+                    boxes = boxes.cpu().numpy()
+                if isinstance(scores, torch.Tensor):
+                    scores = scores.cpu().numpy()
 
-            prompt_count = 0
-            for box, score in zip(boxes, scores):
-                if score >= min_score:
-                    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-                    all_detected_boxes.append({
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "score": float(score),
-                        "prompt": prompt  # 记录来源 prompt
-                    })
-                    prompt_count += 1
-                    print(f"    对象 {prompt_count}: ({x1}, {y1}, {x2}, {y2}), score={score:.3f}")
-                else:
-                    print(f"    跳过: score={score:.3f} < {min_score}")
+                prompt_count = 0
+                for box, score in zip(boxes, scores):
+                    if score >= min_score:
+                        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                        all_detected_boxes.append({
+                            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                            "score": float(score),
+                            "prompt": prompt  # 记录来源 prompt
+                        })
+                        prompt_count += 1
+                        print(f"    对象 {prompt_count}: ({x1}, {y1}, {x2}, {y2}), score={score:.3f}")
+                    else:
+                        print(f"    跳过: score={score:.3f} < {min_score}")
 
-            print(f"  '{prompt}' 检测到 {prompt_count} 个有效对象")
-            total_detected += prompt_count
+                print(f"  '{prompt}' 检测到 {prompt_count} 个有效对象")
+                total_detected += prompt_count
 
         del model, processor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1842,7 +2050,7 @@ class BriaRMBG2Remover:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model_repo_id = "briaai/RMBG-2.0"
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"
         self.device = device
         hf_token = _get_hf_token()
 
@@ -2086,17 +2294,35 @@ Please output ONLY the SVG code, starting with <svg and ending with </svg>. Do n
 Please output ONLY the SVG code, starting with <svg and ending with </svg>. Do not include any explanation or markdown formatting."""
 
     contents = [prompt_text, figure_img, samed_img]
+    expected_box_count = 0
+    prompt_box_summary = ""
+    if not no_icon_mode:
+        with open(boxlib_path, 'r', encoding='utf-8') as f:
+            boxlib = json.load(f)
+        boxes = boxlib.get("boxes", [])
+        expected_box_count = len(boxes)
+        prompt_box_summary = _format_box_requirements(boxes)
 
     print(f"发送多模态请求到: {base_url}")
 
-    content = call_llm_multimodal(
-        contents=contents,
-        api_key=api_key,
-        model=model,
-        base_url=base_url,
-        provider=provider,
-        max_tokens=50000,
-    )
+    try:
+        content = call_llm_multimodal(
+            contents=contents,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            provider=provider,
+            max_tokens=50000,
+        )
+    except Exception as exc:
+        if provider == "local_vllm" and not no_icon_mode:
+            print(f"[local_vllm] 多模态调用失败（{exc}），回退到混合保底模板")
+            return create_hybrid_template_svg(
+                figure_path=figure_path,
+                boxlib_path=boxlib_path,
+                output_path=output_path,
+            )
+        raise
 
     if not content:
         raise Exception(
@@ -2108,6 +2334,109 @@ Please output ONLY the SVG code, starting with <svg and ending with </svg>. Do n
 
     if not svg_code:
         raise Exception('无法从响应中提取 SVG 代码')
+
+    if provider == "local_vllm" and not no_icon_mode and _looks_like_low_effort_placeholder_svg(svg_code, expected_box_count):
+        print("[local_vllm] 检测到低质量占位模板，使用单图+显式坐标重试")
+        retry_prompt = base_prompt + f"""
+EXACT PLACEHOLDER INVENTORY:
+You MUST include all {expected_box_count} icon placeholder groups with these exact ids and coordinates:
+{prompt_box_summary}
+
+STRICT OUTPUT REQUIREMENTS:
+- Reconstruct the full diagram, not a toy example and not a partial stub
+- Preserve all visible text, arrows, connectors, frames, and layout from the original figure
+- Keep icon regions as placeholder groups with ids AF01..AF{expected_box_count:02d}
+- Use the coordinates above exactly for the placeholder rectangles
+- The result should contain many non-placeholder SVG elements for the actual diagram structure
+- Do not output only a row of placeholder boxes
+- Output ONLY raw SVG
+"""
+        retry_content = call_llm_multimodal(
+            contents=[retry_prompt, figure_img],
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            provider=provider,
+            max_tokens=50000,
+            temperature=0.2,
+        )
+        retry_svg_code = extract_svg_code(retry_content) if retry_content else None
+        if retry_svg_code and not _looks_like_low_effort_placeholder_svg(retry_svg_code, expected_box_count):
+            print("[local_vllm] 单图重试得到更完整的模板")
+            svg_code = retry_svg_code
+        else:
+            # Third attempt: scaffold-based approach
+            # Pre-build SVG with all placeholder boxes already correctly placed,
+            # then ask LLM to add only the structural diagram elements (text, arrows, etc.)
+            print("[local_vllm] 尝试脚手架引导生成：预置占位框，请求 LLM 补全结构元素")
+            with open(boxlib_path, 'r', encoding='utf-8') as _f:
+                _boxlib = json.load(_f)
+            _boxes = _boxlib.get("boxes", [])
+            _scaffold_groups = []
+            for _i, _b in enumerate(_boxes):
+                _x1, _y1 = int(_b.get("x1", 0)), int(_b.get("y1", 0))
+                _x2, _y2 = int(_b.get("x2", _x1)), int(_b.get("y2", _y1))
+                _rw = max(1, _x2 - _x1)
+                _rh = max(1, _y2 - _y1)
+                _cx = _x1 + _rw / 2
+                _cy = _y1 + _rh / 2
+                _fs = max(12, min(_rw, _rh) * 0.18)
+                _label_id = f"AF{_i+1:02d}"
+                _scaffold_groups.append(
+                    f'  <g id="{_label_id}">\n'
+                    f'    <rect x="{_x1}" y="{_y1}" width="{_rw}" height="{_rh}" fill="#808080" stroke="black" stroke-width="2"/>\n'
+                    f'    <text x="{_cx:.0f}" y="{_cy:.0f}" text-anchor="middle" dominant-baseline="middle" fill="white" font-size="{_fs:.0f}">&lt;AF&gt;{_i+1:02d}</text>\n'
+                    f'  </g>'
+                )
+            _scaffold_svg = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="{figure_width}" height="{figure_height}" '
+                f'viewBox="0 0 {figure_width} {figure_height}">\n'
+                + "\n".join(_scaffold_groups)
+                + "\n</svg>"
+            )
+            scaffold_prompt = f"""You are adding structural diagram elements to a partially completed SVG.
+
+The SVG below already has all {expected_box_count} icon placeholder boxes correctly placed (with ids AF01–AF{expected_box_count:02d}).
+Your job is to INSERT additional SVG elements BEFORE the first <g> tag to reconstruct the diagram's background structure:
+- Text labels, titles, and annotations
+- Arrows, lines, connectors between boxes
+- Frames, panels, background rectangles
+- Any other non-icon structural elements visible in the reference image
+
+RULES:
+- Do NOT modify or remove any existing <g id="AF..."> elements
+- Do NOT add new placeholder boxes; only add structural/background elements
+- Keep the existing <svg> header and </svg> footer unchanged
+- Output ONLY the complete SVG (starting with <svg, ending with </svg>)
+
+REFERENCE IMAGE: The attached image shows the original diagram you must match.
+
+CURRENT SVG SCAFFOLD (modify this by inserting elements before the first <g>):
+{_scaffold_svg}
+"""
+            scaffold_content = call_llm_multimodal(
+                contents=[scaffold_prompt, figure_img],
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                provider=provider,
+                max_tokens=50000,
+                temperature=0.1,
+            )
+            scaffold_svg_code = extract_svg_code(scaffold_content) if scaffold_content else None
+            if scaffold_svg_code and not _looks_like_low_effort_placeholder_svg(scaffold_svg_code, expected_box_count):
+                print("[local_vllm] 脚手架引导生成得到有效模板")
+                svg_code = scaffold_svg_code
+            else:
+                # LLM could not improve the scaffold — use the scaffold SVG itself.
+                # It already contains all AF-labeled groups with correct coordinates,
+                # which is strictly better than the hybrid PNG-embed fallback.
+                print("[local_vllm] 脚手架 LLM 未改善质量，直接使用脚手架 SVG（已含全部 AF 分组）")
+                output_path_obj = Path(output_path)
+                output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+                output_path_obj.write_text(_scaffold_svg, encoding="utf-8")
+                print(f"脚手架 SVG 已保存: {output_path_obj}")
+                return str(output_path_obj)
 
     # 步骤 4.5：SVG 语法验证和修复
     svg_code = check_and_fix_svg(
@@ -2835,101 +3164,38 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
 # 主函数：完整流程
 # ============================================================================
 
-def method_to_svg(
-    method_text: str,
-    output_dir: str = "./output",
-    api_key: str = None,
-    base_url: str = None,
-    provider: ProviderType = "bianxie",
-    image_gen_model: str = None,
-    svg_gen_model: str = None,
-    sam_prompts: str = "icon",
-    min_score: float = 0.5,
-    sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
-    sam_api_key: Optional[str] = None,
-    sam_max_masks: int = 32,
-    rmbg_model_path: Optional[str] = None,
-    stop_after: int = 5,
-    placeholder_mode: PlaceholderMode = "label",
-    optimize_iterations: int = 2,
-    merge_threshold: float = 0.9,
-    image_size: str = GEMINI_DEFAULT_IMAGE_SIZE,
+def _run_svg_pipeline(
+    figure_path: Path,
+    output_dir: Path,
+    api_key: str,
+    base_url: str,
+    provider: ProviderType,
+    svg_gen_model: str,
+    sam_prompts: str,
+    min_score: float,
+    sam_backend: Literal["local", "fal", "roboflow", "api"],
+    sam_api_key: Optional[str],
+    sam_max_masks: int,
+    sam_checkpoint_path: Optional[str],
+    rmbg_model_path: Optional[str],
+    stop_after: int,
+    placeholder_mode: PlaceholderMode,
+    optimize_iterations: int,
+    merge_threshold: float,
 ) -> dict:
-    """
-    完整流程：Paper Method → SVG with Icons
-
-    Args:
-        method_text: Paper method 文本内容
-        output_dir: 输出目录
-        api_key: API Key
-        base_url: API base URL
-        provider: API 提供商
-        image_gen_model: 生图模型
-        svg_gen_model: SVG 生成模型
-        sam_prompts: SAM3 文本提示，支持逗号分隔的多个prompt（如 "icon,diagram,arrow"）
-        min_score: SAM3 最低置信度
-        sam_backend: SAM3 后端（local/fal/roboflow/api）
-        sam_api_key: SAM3 API Key（api 模式使用）
-        sam_max_masks: SAM3 API 最大 masks 数（api 模式使用）
-        rmbg_model_path: RMBG 模型路径
-        stop_after: 执行到指定步骤后停止
-        placeholder_mode: 占位符模式
-            - "none": 无特殊样式
-            - "box": 传入 boxlib 坐标
-            - "label": 灰色填充+黑色边框+序号标签（推荐）
-        optimize_iterations: 步骤 4.6 优化迭代次数（0 表示跳过优化）
-        merge_threshold: Box合并阈值，重叠比例超过此值则合并（0表示不合并，默认0.9）
-
-    Returns:
-        结果字典
-    """
-    if not api_key:
-        raise ValueError("必须提供 api_key")
-
-    # 获取默认配置
-    config = PROVIDER_CONFIGS[provider]
-    if base_url is None:
-        base_url = config["base_url"]
-    if image_gen_model is None:
-        image_gen_model = config["default_image_model"]
-    if svg_gen_model is None:
-        svg_gen_model = config["default_svg_model"]
-
+    figure_path = Path(figure_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n" + "=" * 60)
-    print("Paper Method 到 SVG 图标替换流程 (Label 模式增强版 + Box合并)")
-    print("=" * 60)
-    print(f"Provider: {provider}")
-    print(f"输出目录: {output_dir}")
-    print(f"生图模型: {image_gen_model}")
-    print(f"SVG模型: {svg_gen_model}")
-    print(f"SAM提示词: {sam_prompts}")
-    print(f"最低置信度: {min_score}")
     sam_backend_value = "fal" if sam_backend == "api" else sam_backend
-    print(f"SAM后端: {sam_backend_value}")
-    if sam_backend_value == "fal":
-        print(f"SAM3 API max_masks: {sam_max_masks}")
-    print(f"执行到步骤: {stop_after}")
-    print(f"占位符模式: {placeholder_mode}")
-    print(f"优化迭代次数: {optimize_iterations}")
-    print(f"Box合并阈值: {merge_threshold}")
-    if provider == "gemini":
-        print(f"生图分辨率: {image_size}")
-    print("=" * 60)
-
-    # 步骤一：生成图片
-    figure_path = output_dir / "figure.png"
-    generate_figure_from_method(
-        method_text=method_text,
-        output_path=str(figure_path),
-        api_key=api_key,
-        model=image_gen_model,
-        base_url=base_url,
-        provider=provider,
-        image_size=image_size,
+    can_use_llm = bool(
+        api_key
+        or provider == "local_vllm"
+        or (provider == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"))
     )
+    template_svg_path = output_dir / "template.svg"
+    optimized_template_path = output_dir / "optimized_template.svg"
+    final_svg_path = output_dir / "final.svg"
 
     if stop_after == 1:
         print("\n" + "=" * 60)
@@ -2946,16 +3212,37 @@ def method_to_svg(
         }
 
     # 步骤二：SAM3 分割（包含Box合并）
-    samed_path, boxlib_path, valid_boxes = segment_with_sam3(
-        image_path=str(figure_path),
-        output_dir=str(output_dir),
-        text_prompts=sam_prompts,
-        min_score=min_score,
-        merge_threshold=merge_threshold,
-        sam_backend=sam_backend_value,
-        sam_api_key=sam_api_key,
-        sam_max_masks=sam_max_masks,
-    )
+    try:
+        samed_path, boxlib_path, valid_boxes = segment_with_sam3(
+            image_path=str(figure_path),
+            output_dir=str(output_dir),
+            text_prompts=sam_prompts,
+            min_score=min_score,
+            merge_threshold=merge_threshold,
+            sam_backend=sam_backend_value,
+            sam_api_key=sam_api_key,
+            sam_max_masks=sam_max_masks,
+            sam_checkpoint_path=sam_checkpoint_path,
+        )
+    except Exception as exc:
+        if can_use_llm:
+            raise
+        print(f"SAM 分割失败（{exc}），改用内嵌原图的保底 SVG")
+        create_embedded_figure_svg(
+            figure_path=str(figure_path),
+            output_path=str(template_svg_path),
+        )
+        if stop_after >= 5:
+            shutil.copyfile(template_svg_path, final_svg_path)
+        return {
+            "figure_path": str(figure_path),
+            "samed_path": None,
+            "boxlib_path": None,
+            "icon_infos": [],
+            "template_svg_path": str(template_svg_path),
+            "optimized_template_path": None,
+            "final_svg_path": str(final_svg_path) if final_svg_path.is_file() else None,
+        }
 
     no_icon_mode = len(valid_boxes) == 0
     if no_icon_mode:
@@ -2981,6 +3268,8 @@ def method_to_svg(
     icon_infos = []
     if no_icon_mode:
         print("步骤三跳过：当前为无图标回退模式")
+    elif stop_after == 4:
+        print("步骤三跳过：stop_after=4 时模板 SVG 生成不依赖图标裁切")
     else:
         _ensure_rmbg2_access_ready(rmbg_model_path)
         icon_infos = crop_and_remove_background(
@@ -3005,44 +3294,50 @@ def method_to_svg(
         }
 
     # 步骤四：生成 SVG 模板
-    template_svg_path = output_dir / "template.svg"
-    optimized_template_path = output_dir / "optimized_template.svg"
-    final_svg_path = output_dir / "final.svg"
-    try:
-        generate_svg_template(
+    if can_use_llm:
+        try:
+            generate_svg_template(
+                figure_path=str(figure_path),
+                samed_path=samed_path,
+                boxlib_path=boxlib_path,
+                output_path=str(template_svg_path),
+                api_key=api_key,
+                model=svg_gen_model,
+                base_url=base_url,
+                provider=provider,
+                placeholder_mode=placeholder_mode,
+                no_icon_mode=no_icon_mode,
+            )
+
+            # 步骤 4.6：LLM 优化 SVG 模板（可配置迭代次数，0 表示跳过）
+            optimize_svg_with_llm(
+                figure_path=str(figure_path),
+                samed_path=samed_path,
+                final_svg_path=str(template_svg_path),
+                output_path=str(optimized_template_path),
+                api_key=api_key,
+                model=svg_gen_model,
+                base_url=base_url,
+                provider=provider,
+                max_iterations=optimize_iterations,
+                skip_base64_validation=True,
+                no_icon_mode=no_icon_mode,
+            )
+        except Exception as exc:
+            if not no_icon_mode:
+                raise
+            print(f"无图标模式下 SVG 重建失败（{exc}），改用内嵌原图的保底 SVG")
+            create_embedded_figure_svg(
+                figure_path=str(figure_path),
+                output_path=str(final_svg_path),
+            )
+    else:
+        print("未提供主模型 api_key，使用 SAM 检测结果生成占位模板 SVG")
+        create_placeholder_template_svg(
             figure_path=str(figure_path),
-            samed_path=samed_path,
             boxlib_path=boxlib_path,
             output_path=str(template_svg_path),
-            api_key=api_key,
-            model=svg_gen_model,
-            base_url=base_url,
-            provider=provider,
-            placeholder_mode=placeholder_mode,
-            no_icon_mode=no_icon_mode,
-        )
-
-        # 步骤 4.6：LLM 优化 SVG 模板（可配置迭代次数，0 表示跳过）
-        optimize_svg_with_llm(
-            figure_path=str(figure_path),
-            samed_path=samed_path,
-            final_svg_path=str(template_svg_path),
-            output_path=str(optimized_template_path),
-            api_key=api_key,
-            model=svg_gen_model,
-            base_url=base_url,
-            provider=provider,
-            max_iterations=optimize_iterations,
-            skip_base64_validation=True,
-            no_icon_mode=no_icon_mode,
-        )
-    except Exception as exc:
-        if not no_icon_mode:
-            raise
-        print(f"无图标模式下 SVG 重建失败（{exc}），改用内嵌原图的保底 SVG")
-        create_embedded_figure_svg(
-            figure_path=str(figure_path),
-            output_path=str(final_svg_path),
+            include_original_image=(stop_after >= 5),
         )
 
     if stop_after == 4:
@@ -3133,6 +3428,208 @@ def method_to_svg(
     }
 
 
+def image_to_svg(
+    image_path: str,
+    output_dir: str = "./output",
+    api_key: str = None,
+    base_url: str = None,
+    provider: ProviderType = "bianxie",
+    svg_gen_model: str = None,
+    sam_prompts: str = "icon",
+    min_score: float = 0.5,
+    sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
+    sam_api_key: Optional[str] = None,
+    sam_max_masks: int = 32,
+    sam_checkpoint_path: Optional[str] = None,
+    rmbg_model_path: Optional[str] = None,
+    stop_after: int = 5,
+    placeholder_mode: PlaceholderMode = "label",
+    optimize_iterations: int = 2,
+    merge_threshold: float = 0.9,
+) -> dict:
+
+    image_path_obj = Path(image_path)
+    if not image_path_obj.is_file():
+        raise FileNotFoundError(f"输入图片不存在: {image_path}")
+
+    config = PROVIDER_CONFIGS[provider]
+    if base_url is None:
+        base_url = config["base_url"]
+    if svg_gen_model is None:
+        svg_gen_model = config["default_svg_model"]
+
+    output_dir_obj = Path(output_dir)
+    output_dir_obj.mkdir(parents=True, exist_ok=True)
+    figure_path = output_dir_obj / "figure.png"
+
+    print("\n" + "=" * 60)
+    print("图片到 SVG 图标替换流程")
+    print("=" * 60)
+    print(f"Provider: {provider}")
+    print(f"输入图片: {image_path_obj}")
+    print(f"输出目录: {output_dir_obj}")
+    print(f"SVG模型: {svg_gen_model}")
+    print(f"SAM提示词: {sam_prompts}")
+    print(f"最低置信度: {min_score}")
+    sam_backend_value = "fal" if sam_backend == "api" else sam_backend
+    print(f"SAM后端: {sam_backend_value}")
+    if sam_backend_value == "fal":
+        print(f"SAM3 API max_masks: {sam_max_masks}")
+    print(f"执行到步骤: {stop_after}")
+    print(f"占位符模式: {placeholder_mode}")
+    print(f"优化迭代次数: {optimize_iterations}")
+    print(f"Box合并阈值: {merge_threshold}")
+    print("=" * 60)
+
+    with Image.open(image_path_obj) as source_image:
+        normalized_image = ImageOps.exif_transpose(source_image).convert("RGB")
+        normalized_image.save(figure_path, format="PNG")
+
+    print(f"已将输入图片标准化为: {figure_path}")
+
+    return _run_svg_pipeline(
+        figure_path=figure_path,
+        output_dir=output_dir_obj,
+        api_key=api_key,
+        base_url=base_url,
+        provider=provider,
+        svg_gen_model=svg_gen_model,
+        sam_prompts=sam_prompts,
+        min_score=min_score,
+        sam_backend=sam_backend,
+        sam_api_key=sam_api_key,
+        sam_max_masks=sam_max_masks,
+        sam_checkpoint_path=sam_checkpoint_path,
+        rmbg_model_path=rmbg_model_path,
+        stop_after=stop_after,
+        placeholder_mode=placeholder_mode,
+        optimize_iterations=optimize_iterations,
+        merge_threshold=merge_threshold,
+    )
+
+
+def method_to_svg(
+    method_text: str,
+    output_dir: str = "./output",
+    api_key: str = None,
+    base_url: str = None,
+    provider: ProviderType = "bianxie",
+    image_gen_model: str = None,
+    svg_gen_model: str = None,
+    sam_prompts: str = "icon",
+    min_score: float = 0.5,
+    sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
+    sam_api_key: Optional[str] = None,
+    sam_max_masks: int = 32,
+    sam_checkpoint_path: Optional[str] = None,
+    rmbg_model_path: Optional[str] = None,
+    stop_after: int = 5,
+    placeholder_mode: PlaceholderMode = "label",
+    optimize_iterations: int = 2,
+    merge_threshold: float = 0.9,
+    image_size: str = GEMINI_DEFAULT_IMAGE_SIZE,
+) -> dict:
+    """
+    完整流程：Paper Method → SVG with Icons
+
+    Args:
+        method_text: Paper method 文本内容
+        output_dir: 输出目录
+        api_key: API Key
+        base_url: API base URL
+        provider: API 提供商
+        image_gen_model: 生图模型
+        svg_gen_model: SVG 生成模型
+        sam_prompts: SAM3 文本提示，支持逗号分隔的多个prompt（如 "icon,diagram,arrow"）
+        min_score: SAM3 最低置信度
+        sam_backend: SAM3 后端（local/fal/roboflow/api）
+        sam_api_key: SAM3 API Key（api 模式使用）
+        sam_max_masks: SAM3 API 最大 masks 数（api 模式使用）
+        rmbg_model_path: RMBG 模型路径
+        stop_after: 执行到指定步骤后停止
+        placeholder_mode: 占位符模式
+            - "none": 无特殊样式
+            - "box": 传入 boxlib 坐标
+            - "label": 灰色填充+黑色边框+序号标签（推荐）
+        optimize_iterations: 步骤 4.6 优化迭代次数（0 表示跳过优化）
+        merge_threshold: Box合并阈值，重叠比例超过此值则合并（0表示不合并，默认0.9）
+
+    Returns:
+        结果字典
+    """
+    if not api_key:
+        raise ValueError("必须提供 api_key")
+    if provider == "local_vllm":
+        raise ValueError(
+            "local_vllm 仅支持已有图片 -> SVG 流程；文本 -> 生图 -> SVG 请使用支持生图的 provider。"
+        )
+
+    # 获取默认配置
+    config = PROVIDER_CONFIGS[provider]
+    if base_url is None:
+        base_url = config["base_url"]
+    if image_gen_model is None:
+        image_gen_model = config["default_image_model"]
+    if svg_gen_model is None:
+        svg_gen_model = config["default_svg_model"]
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print("Paper Method 到 SVG 图标替换流程 (Label 模式增强版 + Box合并)")
+    print("=" * 60)
+    print(f"Provider: {provider}")
+    print(f"输出目录: {output_dir}")
+    print(f"生图模型: {image_gen_model}")
+    print(f"SVG模型: {svg_gen_model}")
+    print(f"SAM提示词: {sam_prompts}")
+    print(f"最低置信度: {min_score}")
+    sam_backend_value = "fal" if sam_backend == "api" else sam_backend
+    print(f"SAM后端: {sam_backend_value}")
+    if sam_backend_value == "fal":
+        print(f"SAM3 API max_masks: {sam_max_masks}")
+    print(f"执行到步骤: {stop_after}")
+    print(f"占位符模式: {placeholder_mode}")
+    print(f"优化迭代次数: {optimize_iterations}")
+    print(f"Box合并阈值: {merge_threshold}")
+    if provider == "gemini":
+        print(f"生图分辨率: {image_size}")
+    print("=" * 60)
+
+    # 步骤一：生成图片
+    figure_path = output_dir / "figure.png"
+    generate_figure_from_method(
+        method_text=method_text,
+        output_path=str(figure_path),
+        api_key=api_key,
+        model=image_gen_model,
+        base_url=base_url,
+        provider=provider,
+        image_size=image_size,
+    )
+
+    return _run_svg_pipeline(
+        figure_path=figure_path,
+        output_dir=output_dir,
+        api_key=api_key,
+        base_url=base_url,
+        provider=provider,
+        svg_gen_model=svg_gen_model,
+        sam_prompts=sam_prompts,
+        min_score=min_score,
+        sam_backend=sam_backend,
+        sam_api_key=sam_api_key,
+        sam_max_masks=sam_max_masks,
+        sam_checkpoint_path=sam_checkpoint_path,
+        rmbg_model_path=rmbg_model_path,
+        stop_after=stop_after,
+        placeholder_mode=placeholder_mode,
+        optimize_iterations=optimize_iterations,
+        merge_threshold=merge_threshold,
+    )
+
+
 def create_embedded_figure_svg(
     figure_path: str,
     output_path: str,
@@ -3160,6 +3657,138 @@ def create_embedded_figure_svg(
     return str(output_path_obj)
 
 
+def create_placeholder_template_svg(
+    figure_path: str,
+    boxlib_path: str,
+    output_path: str,
+    include_original_image: bool = False,
+) -> str:
+    figure_img = Image.open(figure_path)
+    width, height = figure_img.size
+    with open(boxlib_path, 'r', encoding='utf-8') as f:
+        boxlib = json.load(f)
+
+    boxes = boxlib.get("boxes", [])
+    svg_parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '  <rect width="100%" height="100%" fill="#ffffff"/>',
+    ]
+
+    if include_original_image:
+        buf = io.BytesIO()
+        figure_img.save(buf, format="PNG")
+        figure_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        svg_parts.append(
+            f'  <image x="0" y="0" width="{width}" height="{height}" href="data:image/png;base64,{figure_b64}" opacity="0.28" preserveAspectRatio="none"/>'
+        )
+
+    for box in boxes:
+        x1, y1 = int(box.get("x1", 0)), int(box.get("y1", 0))
+        x2, y2 = int(box.get("x2", x1)), int(box.get("y2", y1))
+        label = escape(str(box.get("label", "")))
+        prompt = escape(str(box.get("prompt", "icon")))
+        box_id = label.replace("<", "").replace(">", "").replace("/", "_") or "AF"
+        rect_w = max(1, x2 - x1)
+        rect_h = max(1, y2 - y1)
+        cx = x1 + rect_w / 2
+        cy = y1 + rect_h / 2
+        font_size = max(12, min(rect_w, rect_h) * 0.18)
+        prompt_font_size = max(10, font_size * 0.58)
+        svg_parts.extend([
+            f'  <g id="{box_id}">',
+            f'    <rect x="{x1}" y="{y1}" width="{rect_w}" height="{rect_h}" fill="#808080" fill-opacity="0.78" stroke="#111111" stroke-width="3" rx="8" ry="8"/>',
+            f'    <text x="{cx}" y="{cy}" text-anchor="middle" dominant-baseline="middle" fill="#ffffff" font-size="{font_size:.1f}" font-family="Arial, sans-serif" font-weight="700">{label}</text>',
+            f'    <text x="{cx}" y="{min(height - 12, y2 + max(16, prompt_font_size))}" text-anchor="middle" fill="#444444" font-size="{prompt_font_size:.1f}" font-family="Arial, sans-serif">{prompt}</text>',
+            '  </g>',
+        ])
+
+    svg_parts.append('</svg>')
+    output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path_obj, 'w', encoding='utf-8') as f:
+        f.write("\n".join(svg_parts) + "\n")
+    print(f"SAM 占位模板 SVG 已保存: {output_path_obj}")
+    return str(output_path_obj)
+
+
+def _looks_like_low_effort_placeholder_svg(svg_code: str, expected_boxes: int) -> bool:
+    if not svg_code:
+        return True
+
+    rect_count = len(re.findall(r"<rect\b", svg_code, re.IGNORECASE))
+    group_count = len(re.findall(r"<g\b[^>]*\bid=[\"\']AF\d{2}[\"\']", svg_code, re.IGNORECASE))
+    text_count = len(re.findall(r"&lt;AF&gt;\d{2}|<AF>\d{2}", svg_code, re.IGNORECASE))
+    has_linework = bool(re.search(r"<(line|path|polyline|polygon|ellipse|circle)\b", svg_code, re.IGNORECASE))
+
+    if expected_boxes > 0 and group_count < max(1, expected_boxes // 2):
+        return True
+    if rect_count <= expected_boxes + 1 and not has_linework:
+        return True
+    if text_count <= expected_boxes and not has_linework:
+        return True
+    return False
+
+
+def _format_box_requirements(boxes: list[dict]) -> str:
+    lines = []
+    for box in boxes:
+        x1 = int(box.get("x1", 0))
+        y1 = int(box.get("y1", 0))
+        x2 = int(box.get("x2", x1))
+        y2 = int(box.get("y2", y1))
+        label = str(box.get("label", ""))
+        prompt = str(box.get("prompt", "icon"))
+        lines.append(
+            f"- {label}: x={x1}, y={y1}, width={max(1, x2 - x1)}, height={max(1, y2 - y1)}, prompt={prompt}"
+        )
+    return "\n".join(lines)
+
+
+def create_hybrid_template_svg(
+    figure_path: str,
+    boxlib_path: str,
+    output_path: str,
+) -> str:
+    figure_img = Image.open(figure_path)
+    width, height = figure_img.size
+    with open(boxlib_path, 'r', encoding='utf-8') as f:
+        boxlib = json.load(f)
+
+    boxes = boxlib.get("boxes", [])
+    buf = io.BytesIO()
+    figure_img.save(buf, format="PNG")
+    figure_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    svg_parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        f'  <image x="0" y="0" width="{width}" height="{height}" href="data:image/png;base64,{figure_b64}" preserveAspectRatio="none"/>',
+    ]
+
+    for box in boxes:
+        x1, y1 = int(box.get("x1", 0)), int(box.get("y1", 0))
+        x2, y2 = int(box.get("x2", x1)), int(box.get("y2", y1))
+        label = escape(str(box.get("label", "")))
+        box_id = label.replace("<", "").replace(">", "").replace("/", "_") or "AF"
+        rect_w = max(1, x2 - x1)
+        rect_h = max(1, y2 - y1)
+        cx = x1 + rect_w / 2
+        cy = y1 + rect_h / 2
+        font_size = max(12, min(rect_w, rect_h) * 0.18)
+        svg_parts.extend([
+            f'  <g id="{box_id}">',
+            f'    <rect x="{x1}" y="{y1}" width="{rect_w}" height="{rect_h}" fill="#808080" fill-opacity="0.92" stroke="#111111" stroke-width="3" rx="8" ry="8"/>',
+            f'    <text x="{cx}" y="{cy}" text-anchor="middle" dominant-baseline="middle" fill="#ffffff" font-size="{font_size:.1f}" font-family="Arial, sans-serif" font-weight="700">{label}</text>',
+            '  </g>',
+        ])
+
+    svg_parts.append('</svg>')
+    output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path_obj, 'w', encoding='utf-8') as f:
+        f.write("\n".join(svg_parts) + "\n")
+    print(f"混合保底模板 SVG 已保存: {output_path_obj}")
+    return str(output_path_obj)
+
+
 # ============================================================================
 # 命令行入口
 # ============================================================================
@@ -3173,6 +3802,7 @@ if __name__ == "__main__":
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--method_text", help="Paper method 文本内容")
     input_group.add_argument("--method_file", default="./paper.txt", help="包含 paper method 的文本文件路径")
+    input_group.add_argument("--image_path", help="已有图片路径（直接执行图片到 SVG 流程）")
 
     # 输出参数
     parser.add_argument("--output_dir", default="./output", help="输出目录（默认: ./output）")
@@ -3180,7 +3810,7 @@ if __name__ == "__main__":
     # Provider 参数
     parser.add_argument(
         "--provider",
-        choices=["openrouter", "bianxie", "gemini"],
+        choices=["openrouter", "bianxie", "gemini", "local_vllm", "anthropic"],
         default="bianxie",
         help="API 提供商（默认: bianxie）"
     )
@@ -3217,6 +3847,11 @@ if __name__ == "__main__":
         help="SAM3 后端：local(本地部署)/fal(fal.ai)/roboflow(Roboflow)/api(旧别名=fal)",
     )
     parser.add_argument("--sam_api_key", default=None, help="SAM3 API Key（默认使用 FAL_KEY）")
+    parser.add_argument(
+        "--sam_checkpoint_path",
+        default=os.environ.get("SAM3_CHECKPOINT_PATH"),
+        help="本地 SAM3 checkpoint 路径（可选，优先于 Hugging Face 自动下载）",
+    )
     parser.add_argument(
         "--sam_max_masks",
         type=int,
@@ -3266,36 +3901,60 @@ if __name__ == "__main__":
         parser.error("--use_reference_image 需要 --reference_image_path")
     if args.reference_image_path and not Path(args.reference_image_path).is_file():
         parser.error(f"参考图片不存在: {args.reference_image_path}")
+    if args.image_path and not Path(args.image_path).is_file():
+        parser.error(f"输入图片不存在: {args.image_path}")
 
     USE_REFERENCE_IMAGE = bool(args.use_reference_image)
     REFERENCE_IMAGE_PATH = args.reference_image_path
     if REFERENCE_IMAGE_PATH:
         USE_REFERENCE_IMAGE = True
 
-    # 获取 method 文本：优先使用 --method_text
-    method_text = args.method_text
-    if method_text is None:
-        with open(args.method_file, 'r', encoding='utf-8') as f:
-            method_text = f.read()
+    if args.image_path:
+        result = image_to_svg(
+            image_path=args.image_path,
+            output_dir=args.output_dir,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            provider=args.provider,
+            svg_gen_model=args.svg_model,
+            sam_prompts=args.sam_prompt,
+            min_score=args.min_score,
+            sam_backend=args.sam_backend,
+            sam_api_key=args.sam_api_key,
+            sam_max_masks=args.sam_max_masks,
+            sam_checkpoint_path=args.sam_checkpoint_path,
+            rmbg_model_path=args.rmbg_model_path,
+            stop_after=args.stop_after,
+            placeholder_mode=args.placeholder_mode,
+            optimize_iterations=args.optimize_iterations,
+            merge_threshold=args.merge_threshold,
+        )
+    else:
+        # 获取 method 文本：优先使用 --method_text
+        method_text = args.method_text
+        if method_text is None:
+            with open(args.method_file, 'r', encoding='utf-8') as f:
+                method_text = f.read()
 
-    # 运行完整流程
-    result = method_to_svg(
-        method_text=method_text,
-        output_dir=args.output_dir,
-        api_key=args.api_key,
-        base_url=args.base_url,
-        provider=args.provider,
-        image_gen_model=args.image_model,
-        image_size=args.image_size,
-        svg_gen_model=args.svg_model,
-        sam_prompts=args.sam_prompt,
-        min_score=args.min_score,
-        sam_backend=args.sam_backend,
-        sam_api_key=args.sam_api_key,
-        sam_max_masks=args.sam_max_masks,
-        rmbg_model_path=args.rmbg_model_path,
-        stop_after=args.stop_after,
-        placeholder_mode=args.placeholder_mode,
-        optimize_iterations=args.optimize_iterations,
-        merge_threshold=args.merge_threshold,
-    )
+        # 运行完整流程
+        result = method_to_svg(
+            method_text=method_text,
+            output_dir=args.output_dir,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            provider=args.provider,
+            image_gen_model=args.image_model,
+            image_size=args.image_size,
+            svg_gen_model=args.svg_model,
+            sam_prompts=args.sam_prompt,
+            min_score=args.min_score,
+            sam_backend=args.sam_backend,
+            sam_api_key=args.sam_api_key,
+            sam_max_masks=args.sam_max_masks,
+            sam_checkpoint_path=args.sam_checkpoint_path,
+            rmbg_model_path=args.rmbg_model_path,
+            stop_after=args.stop_after,
+            placeholder_mode=args.placeholder_mode,
+            optimize_iterations=args.optimize_iterations,
+            merge_threshold=args.merge_threshold,
+        )

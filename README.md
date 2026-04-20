@@ -333,10 +333,11 @@ Optional CLI flags (API):
 | **OpenRouter** | `openrouter.ai/api/v1` | Supports Gemini/Claude/others |
 | **Bianxie** | `api.bianxie.ai/v1` | OpenAI-compatible API |
 | **Gemini (Google)** | `generativelanguage.googleapis.com/v1beta` | Official Google Gemini API (`google-genai`) |
+| **local_vllm** | `http://127.0.0.1:8001/v1` | Local OpenAI-compatible vLLM endpoint for image->SVG |
 
 Common CLI flags:
 
-- `--provider` (openrouter | bianxie | gemini)
+- `--provider` (openrouter | bianxie | gemini | local_vllm)
 - `--image_model`, `--svg_model`
 - `--image_size` (1K | 2K | 4K, Gemini only)
 - `--sam_prompt` (comma-separated prompts)
@@ -346,6 +347,45 @@ Common CLI flags:
 - `--merge_threshold` (0 disables merging)
 - `--optimize_iterations` (0 disables optimization)
 - `--reference_image_path` (optional)
+
+### Local Qwen2-VL via vLLM
+
+Use `local_vllm` when you already have an input image and want a local multimodal model to handle steps 4 / 4.5 / 4.6.
+
+Recommended vLLM launch command:
+
+```bash
+HF_HOME=/path/to/writable/huggingface-cache \
+HF_HUB_CACHE=/path/to/writable/huggingface-cache/hub \
+TRANSFORMERS_CACHE=/path/to/writable/huggingface-cache/transformers \
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen2-VL-7B-Instruct \
+  --limit-mm-per-prompt '{"image":10}' \
+  --max-model-len 4096 \
+  --trust-remote-code
+```
+
+Recommended CLI test (image -> template SVG only):
+
+```bash
+python autofigure2.py \
+  --image_path img/method.png \
+  --output_dir outputs/qwen_vllm_demo \
+  --provider local_vllm \
+  --api_key dummy \
+  --base_url http://127.0.0.1:8000/v1 \
+  --svg_model Qwen/Qwen2-VL-7B-Instruct \
+  --sam_backend local \
+  --sam_checkpoint_path ./sam3.pt \
+  --optimize_iterations 0 \
+  --stop_after 4
+```
+
+Notes:
+- `local_vllm` only supports image -> SVG reconstruction steps.
+- It does **not** support step 1 text-to-image generation in this project.
+- For full method-text -> SVG runs, keep using an image-generation-capable provider for step 1.
+- A dummy API key may still be required by OpenAI-compatible clients even for local endpoints; the `local_vllm` provider will fall back to `dummy` when API key is left empty.
 
 ### Custom Provider / Custom Base URL
 

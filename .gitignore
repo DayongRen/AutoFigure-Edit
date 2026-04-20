@@ -26,3 +26,12 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
+
+# Conda environment (large, not for version control)
+.conda_env/
+
+# Large model weights
+*.pt
+*.pt.part
+*.bin
+*.safetensors

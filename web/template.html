@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoFigure-Edit Template</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body data-page="template-input">
+    <div class="page">
+      <header class="topbar">
+        <div>
+          <div class="brand">AutoFigure-Edit Template</div>
+          <div class="subtitle">Convert PNG into an editable SVG template page.</div>
+        </div>
+        <div class="topbar-actions">
+          <button class="ghost" id="backHomeBtn" type="button">Back to Home</button>
+        </div>
+      </header>
+
+      <main class="input-layout">
+        <section class="card">
+          <label class="field-label" for="referenceFile">Source Image</label>
+          <div class="upload-zone" id="uploadZone">
+            <input id="referenceFile" class="file-input" type="file" accept="image/*" />
+            <div class="upload-text" id="uploadText">Drop source image here or click to upload</div>
+          </div>
+          <div class="hint" id="uploadHint">
+            Required. The uploaded PNG will stop at the editable template SVG stage.
+          </div>
+          <div class="upload-meta">
+            <img id="referencePreview" class="upload-preview" alt="Source preview" />
+            <div id="referenceStatus" class="hint">Upload a source image to begin.</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="field-group">
+            <label class="field-label" for="provider">Provider</label>
+            <select id="provider" class="input">
+              <option value="bianxie">Bianxie</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="gemini" selected>Gemini (Google)</option>
+              <option value="local_vllm">Local vLLM (Qwen2-VL)</option>
+            </select>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="apiKey">API Key</label>
+            <input id="apiKey" type="password" class="input" placeholder="sk-..." />
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="baseUrl">Base URL</label>
+            <input id="baseUrl" type="text" class="input" placeholder="http://127.0.0.1:8001/v1" />
+            <div class="hint">For local_vllm, use your vLLM OpenAI-compatible endpoint, for example http://127.0.0.1:8001/v1.</div>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="svgModel">SVG Model</label>
+            <input id="svgModel" type="text" class="input" placeholder="Qwen/Qwen2-VL-7B-Instruct" />
+            <div class="hint">Used for steps 4/4.5/4.6 SVG reconstruction.</div>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="optimizeIterations">Optimize</label>
+            <input id="optimizeIterations" class="input" type="number" min="0" value="0" />
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="samBackend">SAM3 Backend</label>
+            <select id="samBackend" class="input">
+              <option value="roboflow" selected>Roboflow API</option>
+              <option value="fal">fal.ai API</option>
+              <option value="local">Local (SAM3)</option>
+            </select>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="samPrompt">SAM Prompt</label>
+            <input
+              id="samPrompt"
+              type="text"
+              class="input"
+              value="icon,person,robot,animal"
+              placeholder="icon,person,robot,animal"
+            />
+          </div>
+
+          <div class="field-group" id="samApiKeyGroup" hidden>
+            <label class="field-label" for="samApiKey">SAM3 API Key</label>
+            <input
+              id="samApiKey"
+              type="password"
+              class="input"
+              placeholder="FAL/Roboflow API key"
+            />
+          </div>
+
+          <div class="field-group" id="samCheckpointPathGroup" hidden>
+            <label class="field-label" for="samCheckpointPath">SAM3 Checkpoint</label>
+            <input
+              id="samCheckpointPath"
+              type="text"
+              class="input"
+              placeholder="path/to/sam3.pt"
+            />
+          </div>
+        </section>
+
+        <section class="actions">
+          <button id="confirmBtn" class="primary">Generate Template -&gt; Editor</button>
+          <div id="errorMsg" class="error"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -29,11 +29,15 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-PYTHON_EXECUTABLE = os.environ.get("AUTOFIGURE_PYTHON") or sys.executable
+DEFAULT_BUNDLED_PYTHON = BASE_DIR / ".conda_env" / "bin" / "python"
+PYTHON_EXECUTABLE = os.environ.get("AUTOFIGURE_PYTHON") or (
+    str(DEFAULT_BUNDLED_PYTHON) if DEFAULT_BUNDLED_PYTHON.is_file() else sys.executable
+)
 
 DEFAULT_SAM_PROMPT = "icon,person,robot,animal"
 DEFAULT_PLACEHOLDER_MODE = "label"
 DEFAULT_MERGE_THRESHOLD = 0.01
+DEFAULT_LOCAL_RMBG_MODEL_PATH = Path("/mnt/new_disk/dy_workdir/RMBG-2.0")
 
 SVG_EDIT_CANDIDATES = [
     ("vendor/svg-edit/editor/index.html", WEB_DIR / "vendor" / "svg-edit" / "editor" / "index.html"),
@@ -96,11 +100,84 @@ class RunRequest(BaseModel):
     sam_prompt: Optional[str] = None
     sam_backend: Optional[str] = None
     sam_api_key: Optional[str] = None
+    sam_checkpoint_path: Optional[str] = None
     sam_max_masks: Optional[int] = None
     placeholder_mode: Optional[str] = None
     merge_threshold: Optional[float] = None
     optimize_iterations: Optional[int] = None
     reference_image_path: Optional[str] = None
+
+
+class ImageRunRequest(BaseModel):
+    image_path: str = Field(..., min_length=1)
+    provider: str = "bianxie"
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    svg_model: Optional[str] = None
+    sam_prompt: Optional[str] = None
+    sam_backend: Optional[str] = None
+    sam_api_key: Optional[str] = None
+    sam_checkpoint_path: Optional[str] = None
+    sam_max_masks: Optional[int] = None
+    placeholder_mode: Optional[str] = None
+    merge_threshold: Optional[float] = None
+    optimize_iterations: Optional[int] = None
+    stop_after: int = Field(5, ge=1, le=5)
+
+
+def _resolve_project_path(path_value: str, root_dir: Path) -> str:
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        candidate = (root_dir / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    if not str(candidate).startswith(str(root_dir.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return str(candidate)
+
+
+def _launch_job(cmd: list[str], output_dir: Path) -> JSONResponse:
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    log_path = output_dir / "run.log"
+    log_path.write_text(
+        f"[meta] python={PYTHON_EXECUTABLE}\n[meta] cmd={_redact_cmd_args(cmd)}\n",
+        encoding="utf-8",
+    )
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+        cwd=str(BASE_DIR),
+    )
+
+    job = Job(
+        job_id=output_dir.name,
+        output_dir=output_dir,
+        process=process,
+        queue=queue.Queue(),
+        log_path=log_path,
+    )
+    JOBS[job.job_id] = job
+
+    monitor_thread = threading.Thread(target=_monitor_job, args=(job,), daemon=True)
+    monitor_thread.start()
+
+    return JSONResponse({"job_id": job.job_id})
+
+
+def _append_default_rmbg_model(cmd: list[str]) -> None:
+    if "--rmbg_model_path" in cmd:
+        return
+    if DEFAULT_LOCAL_RMBG_MODEL_PATH.is_dir():
+        cmd += ["--rmbg_model_path", str(DEFAULT_LOCAL_RMBG_MODEL_PATH)]
 
 
 app = FastAPI()
@@ -160,6 +237,8 @@ def run_job(req: RunRequest) -> JSONResponse:
         cmd += ["--sam_backend", req.sam_backend]
     if req.sam_api_key:
         cmd += ["--sam_api_key", req.sam_api_key]
+    if req.sam_checkpoint_path:
+        cmd += ["--sam_checkpoint_path", _resolve_project_path(req.sam_checkpoint_path, BASE_DIR)]
     if req.sam_max_masks is not None:
         cmd += ["--sam_max_masks", str(req.sam_max_masks)]
     if req.optimize_iterations is not None:
@@ -167,45 +246,61 @@ def run_job(req: RunRequest) -> JSONResponse:
 
     reference_path = req.reference_image_path
     if reference_path:
-        reference_path = (
-            str((BASE_DIR / reference_path).resolve())
-            if not Path(reference_path).is_absolute()
-            else reference_path
-        )
-        cmd += ["--reference_image_path", reference_path]
+        cmd += ["--reference_image_path", _resolve_project_path(reference_path, BASE_DIR)]
 
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+    _append_default_rmbg_model(cmd)
 
-    log_path = output_dir / "run.log"
-    log_path.write_text(
-        f"[meta] python={PYTHON_EXECUTABLE}\n[meta] cmd={_redact_cmd_args(cmd)}\n",
-        encoding="utf-8",
+    return _launch_job(cmd, output_dir)
+
+
+@app.post("/api/run-image")
+def run_image_job(req: ImageRunRequest) -> JSONResponse:
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
+    output_dir = OUTPUTS_DIR / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        PYTHON_EXECUTABLE,
+        str(BASE_DIR / "autofigure2.py"),
+        "--image_path",
+        _resolve_project_path(req.image_path, BASE_DIR),
+        "--output_dir",
+        str(output_dir),
+        "--provider",
+        req.provider,
+    ]
+
+    if req.api_key:
+        cmd += ["--api_key", req.api_key]
+    if req.base_url:
+        cmd += ["--base_url", req.base_url]
+    if req.svg_model:
+        cmd += ["--svg_model", req.svg_model]
+
+    sam_prompt = req.sam_prompt or DEFAULT_SAM_PROMPT
+    placeholder_mode = req.placeholder_mode or DEFAULT_PLACEHOLDER_MODE
+    merge_threshold = (
+        req.merge_threshold if req.merge_threshold is not None else DEFAULT_MERGE_THRESHOLD
     )
 
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=env,
-        cwd=str(BASE_DIR),
-    )
+    cmd += ["--sam_prompt", sam_prompt]
+    cmd += ["--placeholder_mode", placeholder_mode]
+    cmd += ["--merge_threshold", str(merge_threshold)]
+    if req.sam_backend:
+        cmd += ["--sam_backend", req.sam_backend]
+    if req.sam_api_key:
+        cmd += ["--sam_api_key", req.sam_api_key]
+    if req.sam_checkpoint_path:
+        cmd += ["--sam_checkpoint_path", _resolve_project_path(req.sam_checkpoint_path, BASE_DIR)]
+    if req.sam_max_masks is not None:
+        cmd += ["--sam_max_masks", str(req.sam_max_masks)]
+    if req.optimize_iterations is not None:
+        cmd += ["--optimize_iterations", str(req.optimize_iterations)]
+    cmd += ["--stop_after", str(req.stop_after)]
 
-    job = Job(
-        job_id=job_id,
-        output_dir=output_dir,
-        process=process,
-        queue=queue.Queue(),
-        log_path=log_path,
-    )
-    JOBS[job_id] = job
+    _append_default_rmbg_model(cmd)
 
-    monitor_thread = threading.Thread(target=_monitor_job, args=(job,), daemon=True)
-    monitor_thread.start()
-
-    return JSONResponse({"job_id": job_id})
+    return _launch_job(cmd, output_dir)
 
 
 @app.post("/api/upload")
@@ -340,6 +435,7 @@ def _scan_artifacts(job: Job) -> None:
         output_dir / "figure.png",
         output_dir / "samed.png",
         output_dir / "template.svg",
+        output_dir / "optimized_template.svg",
         output_dir / "final.svg",
     ]
 
@@ -378,6 +474,8 @@ def _classify_artifact(rel_path: str) -> str:
         return "icon_raw"
     if rel_path == "template.svg":
         return "template_svg"
+    if rel_path == "optimized_template.svg":
+        return "optimized_template_svg"
     if rel_path == "final.svg":
         return "final_svg"
     return "artifact"
